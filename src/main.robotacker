@@ -1,0 +1,264 @@
+#include <Arduino.h>
+#include <Wire.h>  
+#include <WiFi.h>
+#include <Adafruit_GFX.h>
+// install lib berikut di platformio (buka terminal dari menu platformio, jalankan pio lib -g install https://github.com .....)
+#include <Adafruit_SH1106.h> //https://github.com/nhatuan84/esp32-sh1106-oled
+
+#include <ArduinoJson.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <AsyncElegantOTA.h>
+#include "SPIFFS.h"
+
+#define CHN_MTRDC 1
+#define CHN_MTRDCR 2
+#define CHN_MTRSRV 4
+#define PWMRES 8
+
+#define MLENCA 33
+#define MLENCB 35
+#define MRENCA 32
+#define MRENCB 34
+
+#define PPRGREY 40//???
+#define PPRORANGE 40//???
+
+#define SRVX 2 // Untuk ackermen / buzzer
+
+//#define MLEN 13
+#define MLIN1 17 //5
+#define MLIN2 18
+//#define MREN 27
+#define MRIN1 19
+#define MRIN2 23
+
+#define SSA 15
+#define SSB 4
+#define SSC 16
+#define SSD 5 // 17
+#define SZ 39
+
+Adafruit_SH1106 display(SDA, SCL);
+// Create AsyncWebServer object on port 80
+AsyncWebServer server(80);
+
+String ssid="loop-1";
+String password="12345678";
+IPAddress IP_ap = {192, 168, 1, 1};
+IPAddress gateway_ap = {192, 168, 1, 1};
+IPAddress NMask_ap = {255, 255, 255, 0};
+
+int btn1,btn2,btn3;
+
+int mtrSRV_freq = 50;
+int mtrSRV_res = 16;
+int mtrDC_freq = 50;
+int mtrDC_res = 8;
+int mtrDC_dutycycle = 0;
+int mtrDC_dutycycleR = 0;
+int mtrSRV_dutycycle = 0;
+int mtrSRV_deg = 0;
+int delayControl = 1000;
+long countL=0,countR=0;
+
+byte bacasensor(int index) {
+  digitalWrite(SSA, (index & 0x01));
+  digitalWrite(SSB, ((index>>1) & 0x01));
+  digitalWrite(SSC, ((index>>2) & 0x01));
+  digitalWrite(SSD, ((index>>3) & 0x01));
+  return (digitalRead(SZ))? 1:0;
+}
+
+void SetServoPos(float pos)
+{
+    uint32_t duty = (((pos/180.0)
+              *2000)/20000.0*65536.0) + 1634;
+         // convert 0-180 degrees to 0-65536
+
+    ledcWrite(CHN_MTRSRV,duty);
+        // set channel to pos
+}
+
+void handleWeb( void * pvParameters ){
+  printf("handleWeb running on core %d\n",xPortGetCoreID()); // on Serial
+  int i;
+
+  //  Route for root / web page
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    Serial.println("request web /");
+    request->send(SPIFFS, "/index.html", "text/html",false);
+  });
+  server.on("/pavicon.ico", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send(404, "text/plain", "Not found");
+  });
+  server.on("/lastdata", HTTP_GET, [](AsyncWebServerRequest *request){
+    String sensor="";
+    for (int i=0; i<16; i++) 
+    { sensor=sensor+String(bacasensor(i)); }
+
+    StaticJsonDocument<2000> myArray;
+    myArray["sensor"]=sensor;
+    myArray["left"]["dutycycle"]=mtrDC_dutycycle;
+    myArray["right"]["dutycycle"]=mtrDC_dutycycleR;
+    myArray["left"]["enc"]=countL;
+    myArray["right"]["enc"]=countR;
+    
+    String jsonString;
+    serializeJson(myArray, jsonString);
+
+    request->send(200, "application/json", jsonString);
+  });
+  server.on("/update", HTTP_PUT, [](AsyncWebServerRequest *request){
+    if (request->hasParam("delay")) {
+         delayControl = request->getParam("delay")->value().toInt();
+         request->send(200, "text/plain", "Berhasil update delay "+String(delayControl));
+    }
+    if (request->hasParam("srvdeg")) {
+         mtrSRV_deg = request->getParam("srvdeg")->value().toInt();
+         SetServoPos(mtrSRV_deg);
+         request->send(200, "text/plain", "Berhasil update servo Deg "+String(mtrSRV_deg));
+    }
+    if (request->hasParam("dcfreq")) {
+         mtrDC_freq = request->getParam("dcfreq")->value().toInt();
+         ledcWriteTone(CHN_MTRDC, mtrDC_freq);
+         ledcWrite(CHN_MTRDC, mtrDC_dutycycle);
+         ledcWrite(CHN_MTRDCR, mtrDC_dutycycleR);
+         request->send(200, "text/plain", "Berhasil update dcfreq "+String(mtrDC_freq));
+    }
+    if (request->hasParam("dcdutycycle")) {
+         mtrDC_dutycycle = request->getParam("dcdutycycle")->value().toInt();
+         ledcWrite(CHN_MTRDC, mtrDC_dutycycle);
+         request->send(200, "text/plain", "Berhasil update dcdutycycle "+String(mtrDC_dutycycle));
+    }
+    if (request->hasParam("dcdutycycleR")) {
+         mtrDC_dutycycleR = request->getParam("dcdutycycleR")->value().toInt();
+         ledcWrite(CHN_MTRDCR, mtrDC_dutycycleR);
+         request->send(200, "text/plain", "Berhasil update dcdutycycleR "+String(mtrDC_dutycycleR));
+    }
+    request->send(200, "text/plain", "Tidak ada yang di update");
+  });
+
+  server.serveStatic("/", SPIFFS, "/");  
+  server.onNotFound([](AsyncWebServerRequest *request){ request->send(404, "text/plain", "Not found"); });
+
+  // Start ElegantOTA
+  AsyncElegantOTA.begin(&server);
+
+  server.begin();
+  for(;;){
+    delay(1000);
+  }
+}
+
+
+void IRAM_ATTR encoderleft() {
+  // countL++;return;
+ if (digitalRead(MLENCB))
+    countL += digitalRead(MLENCA)? 1:-1 ;
+ else 
+    countL -= digitalRead(MLENCA)? 1:-1 ;
+}
+void IRAM_ATTR encoderright() {
+  countR++;return;
+ if (digitalRead(MRENCB))
+    countR += digitalRead(MRENCA)? 1:-1 ;
+ else 
+    countR -= digitalRead(MRENCA)? 1:-1 ;
+}
+
+
+void controlLoop( void * pvParameters ){
+  printf("controlLoop running on core %d\n",xPortGetCoreID()); // on Serial
+  // setup PWM motor
+  
+  digitalWrite(SRVX, LOW);
+  ledcSetup(CHN_MTRSRV, mtrSRV_freq, mtrSRV_res);
+  ledcAttachPin(SRVX, CHN_MTRSRV);
+  ledcWrite(CHN_MTRSRV, mtrSRV_dutycycle);
+  
+  digitalWrite(MLIN1, LOW);
+  ledcSetup(CHN_MTRDC, mtrDC_freq, mtrDC_res);
+  ledcAttachPin(MLIN2, CHN_MTRDC);
+  ledcWrite(CHN_MTRDC, mtrDC_dutycycle);
+  
+  digitalWrite(MRIN1, LOW);
+  ledcSetup(CHN_MTRDCR, mtrDC_freq, mtrDC_res);
+  ledcAttachPin(MRIN2, CHN_MTRDCR);
+  ledcWrite(CHN_MTRDCR, mtrDC_dutycycleR);
+
+  for(;;){
+    
+    vTaskDelay(delayControl/ portTICK_PERIOD_MS);
+  }
+}
+
+// Initialize SPIFFS
+void initSPIFFS() {
+  if (!SPIFFS.begin(true)) {
+    Serial.println("An error has occurred while mounting SPIFFS");
+  }
+  Serial.println("SPIFFS mounted successfully");
+}
+
+void setup() {
+  Serial.begin(115200);
+  display.begin(SH1106_SWITCHCAPVCC, 0x3C);  // initialize with the I2C addr 0x3D (for the 128x64)
+
+  initSPIFFS();
+  WiFi.mode(WIFI_MODE_AP);
+  WiFi.softAP(ssid.c_str(), password.c_str(), 3,0,11); //ssid, passwd, ch, hidden, maxconn
+  WiFi.softAPConfig(IP_ap, IP_ap, NMask_ap);
+   
+  pinMode(MLIN1,OUTPUT);
+  pinMode(MLIN2,OUTPUT);
+  pinMode(MRIN1,OUTPUT);
+  pinMode(MRIN2,OUTPUT);
+  pinMode(SRVX,OUTPUT);
+
+  pinMode(MLENCA,INPUT);
+  pinMode(MLENCB,INPUT);
+  pinMode(MRENCA,INPUT);
+  pinMode(MRENCB,INPUT);
+
+   pinMode(SSA,OUTPUT);
+   pinMode(SSB,OUTPUT);
+   pinMode(SSC,OUTPUT);
+   pinMode(SSD,OUTPUT);
+   pinMode(SZ,INPUT);
+
+  attachInterrupt(MLENCA, encoderleft, CHANGE);
+  attachInterrupt(MRENCA, encoderright, CHANGE);
+  
+  // send Torque Reference to CANbus
+  xTaskCreatePinnedToCore(
+      handleWeb, /* Function to implement the task */
+      "handleWeb", /* Name of the task */
+      10000,  /* Stack size in words */
+      NULL,  /* Task input parameter */
+      0,  /* Priority of the task */
+      NULL,  /* Task handle. */
+      1); /* Core where the task should run */
+  delay(1000);  // send Torque Reference to CANbus
+  xTaskCreatePinnedToCore(
+      controlLoop, /* Function to implement the task */
+      "controlLoop", /* Name of the task */
+      10000,  /* Stack size in words */
+      NULL,  /* Task input parameter */
+      0,  /* Priority of the task */
+      NULL,  /* Task handle. */
+      0); /* Core where the task should run */
+  delay(1000);
+  
+}
+
+void loop() {
+  // put your main code here, to run repeatedly:
+  display.clearDisplay();
+  display.setTextSize(1.1);
+  display.setTextColor(WHITE, BLACK);
+  display.setCursor(0,0);display.println("Status Counter");
+  display.setCursor(0,20);display.println(String(countL)+" "+String(countR));
+  display.display();
+  delay(1000);
+}
